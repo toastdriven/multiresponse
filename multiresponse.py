@@ -1,13 +1,43 @@
+"""
+A Python class for Django to provide mime type aware responses. This allows a
+client to receive different responses based on the HTTP "Accept" header they
+send. This is used in place of ``render_to_response`` or a manual
+``HttpResponse``.
+
+
+Sample Usage:
+-------------
+
+  def index(request, extension):
+        sample_people = [
+            {'name': 'Daniel', 'age': 26},
+            {'name': 'John', 'age': 26},
+            {'name': 'Jane', 'age': 20},
+            {'name': 'Bob', 'age': 35},
+        ]
+
+        mr = MultiResponse(request)
+        mr.register('html', 'index.html')
+        mr.register('xml', 'people.xml')
+        mr.register('json', 'people.json')
+        mr.register('txt', 'people.txt')
+        return mr.render({
+            'people': sample_people,
+        })
+"""
+import mimeparse
 from django.conf import settings
 from django.shortcuts import render_to_response
 
 
+__version__ = '1.0.1'
+__author__ = 'Daniel Lindsley'
+
 ACCEPT_HEADER_MAPPING = {
     'text/html': 'html',
     'application/xml': 'xml',
-    'text/xml': 'xml', # Broken but we're including it.
     'application/json': 'json',
-    'text/plain': 'text',
+    'text/plain': 'txt',
 }
 
 
@@ -24,6 +54,12 @@ class MultiResponse(object):
         * ``json``
         * ``txt``
 
+    This list can be extended/altered in your settings file by providing a
+    ``ACCEPT_HEADER_MAPPING`` mapping with the same structure as the built-in
+    mappings (key - actual mime type, value - short mime). By using the short
+    mapping, you can serve multiple mime types with the same (appropriate)
+    response.
+    
     If no appropriate match is found in the "Accept" header, the default mime
     type will be served.
     """
@@ -35,18 +71,6 @@ class MultiResponse(object):
         
         if hasattr(settings, 'ACCEPT_HEADER_MAPPING'):
             self.accept_header_mapping.update(settings.ACCEPT_HEADER_MAPPING)
-    
-    def client_accepted_mime_types(self):
-        accepted_mime_types = []
-        
-        for mime in self.request.META.get('HTTP_ACCEPT').split(','):
-            mime_no_whitespace = mime.strip()
-            mime_info = mime_no_whitespace.split(';')
-            # We don't handle levels/qualities right now, though we should eventually.
-            cleaned_mime = mime_info[0]
-            accepted_mime_types.append(cleaned_mime)
-        
-        return accepted_mime_types
     
     def register(self, mime_type, template, default=False):
         """
@@ -61,27 +85,11 @@ class MultiResponse(object):
         
         self.templates[mime_type] = template
     
-    def determine_extension(self):
-        """Attempt to intelligently discern from the URL what the desired 
-        extension is."""
-        desired_extension = None
-        request_path_pieces = [piece for piece in self.request.path.split('/') if piece != '']
-        
-        try:
-            # Just look at the last bit.
-            extension = request_path_pieces.pop()
-            
-            if extension in self.templates.keys():
-                desired_extension = extension
-        except IndexError:
-            # Fail silently.
-            pass
-        
-        return desired_extension
-    
     def render(self, context=None, **kwargs):
-        """Renders the desired template with the context. Accepts the same
-        kwargs as render_to_response."""
+        """
+        Renders the desired template (determined via the client's accepted mime
+        types) with the context. Accepts the same kwargs as render_to_response. 
+        """
         desired_template = ''
         content_type = 'text/html'
         
@@ -89,18 +97,23 @@ class MultiResponse(object):
             raise RuntimeError('You must register at least one mime type and template with MultiResponse before rendering.')
         
         if 'HTTP_ACCEPT' in self.request.META:
-            extension = self.determine_extension()
+            registered_types = []
             
-            if extension in self.templates.keys():
-                for mime in self.client_accepted_mime_types():
-                    if mime in self.accept_header_mapping and self.accept_header_mapping[mime] == extension:
-                        content_type = mime
-                        desired_template = self.templates[extension]
-                        break
+            for mime, short in self.accept_header_mapping.items():
+                if short in self.templates.keys():
+                    registered_types.append(mime)
+            
+            content_type = mimeparse.best_match(registered_types, self.request.META['HTTP_ACCEPT'])
+            short_type = self.accept_header_mapping.get(content_type)
+            
+            if short_type in self.templates.keys():
+                desired_template = self.templates.get(short_type)
     
         if not desired_template:
             try:
                 desired_template = self.templates.get(self.default_type)
+                # Fail miserably.
+                content_type = 'text/plain'
             except KeyError:
                 raise RuntimeError('The default mime type could not be found in the registered templates.')
     
